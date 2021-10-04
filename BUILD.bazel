@@ -38,6 +38,7 @@ cc_library(
         "stout/take.h",
         "stout/range.h",
         "stout/let.h",
+        "stout/stream-for-each.h",
     ],
     srcs = [
         "stout/scheduler.cc",

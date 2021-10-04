@@ -63,6 +63,9 @@ auto Iterate(Container&& container) {
           k.Ended();
         }
       })
+      .stop([](auto&, auto& k) {
+        k.Stop();
+      })
       .done([](auto&, auto& k) {
         k.Ended();
       });
