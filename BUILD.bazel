@@ -35,6 +35,7 @@ cc_library(
         "stout/sequence.h",
         "stout/static-thread-pool.h",
         "stout/stream.h",
+        "stout/stream-for-each.h",
         "stout/take.h",
         "stout/task.h",
         "stout/terminal.h",
@@ -42,7 +43,6 @@ cc_library(
         "stout/type-traits.h",
         "stout/undefined.h",
         "stout/until.h",
-        "stout/stream-for-each.h",
     ],
     visibility = ["//visibility:private"],
     deps = [
@@ -79,6 +79,7 @@ cc_library(
         # Compiles without any SSL support on Windows.
         # See bazel-rules-curl for more details.
         "@com_github_curl_curl//:libcurl",
+        "@com_github_tencent_rapidjson//:rapidjson",
     ],
 )
 
