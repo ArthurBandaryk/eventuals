@@ -30,6 +30,7 @@ eventuals_events_sources = [
     "event-loop-test.h",
     "dns-resolver.cc",
     "signal.cc",
+    "tcp.cc",
 ]
 
 eventuals_http_sources = [
