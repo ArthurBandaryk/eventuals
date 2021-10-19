@@ -156,6 +156,42 @@ struct _Reschedule {
       k_.Register(interrupt);
     }
 
+    template <typename... Args>
+    void Body(Args&&... args) {
+      context_->Continue(
+          [&]() {
+            k_.Body(std::forward<Args>(args)...);
+          },
+          [&]() {
+            static_assert(
+                sizeof...(args) == 0 || sizeof...(args) == 1,
+                "Reschedule only supports 0 or 1 argument, but found > 1");
+
+            static_assert(std::is_void_v<Arg_> || sizeof...(args) == 1);
+
+            if constexpr (!std::is_void_v<Arg_>) {
+              arg_.emplace(std::forward<Args>(args)...);
+            }
+
+            EVENTUALS_LOG(1)
+                << "Reschedule submitting '" << context_->name() << "'";
+
+            return [this]() {
+              if constexpr (sizeof...(args) == 1) {
+                k_.Body(std::move(*arg_));
+              } else {
+                k_.Body();
+              }
+            };
+          });
+    }
+
+    void Ended() {
+      context_->Continue([this]() {
+        k_.Ended();
+      });
+    }
+
     K_ k_;
     Scheduler::Context* context_;
 
