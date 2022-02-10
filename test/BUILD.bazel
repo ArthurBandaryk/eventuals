@@ -46,6 +46,7 @@ cc_test(
     name = "eventuals",
     srcs = [
         "callback.cc",
+        "catch.cc",
         "closure.cc",
         "collect.cc",
         "conditional.cc",
