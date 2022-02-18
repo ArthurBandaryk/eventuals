@@ -1,11 +1,11 @@
 #pragma once
 
-#include <any>
 #include <memory> // For 'std::unique_ptr'.
 #include <optional>
 #include <tuple>
 #include <variant> // For 'std::monostate'.
 
+#include "eventuals/callback.h"
 #include "eventuals/eventual.h"
 #include "eventuals/then.h"
 
@@ -47,6 +47,7 @@ struct _Catch {
           typename std::invoke_result<Handler_, Args...>::type;
 
       if constexpr (HasValueFrom<HandlerInvokeResult>::value) {
+        CHECK(!constructed_k_.has_value()) << "Reuse of catch handler";
         constructed_k_.emplace(
             (handler_(std::forward<Args>(args)...)
                  .template k<void>(_Then::Adaptor<K>{k})));
@@ -73,19 +74,18 @@ struct _Catch {
       } else if constexpr (std::is_same_v<E, std::exception_ptr>) {
         try {
           std::rethrow_exception(error);
-        } catch (Error_ e) {
+        }
+        // Catch by reference because if 'Error_' is a polymorphic type
+        // it can't be catched by value.
+        catch (Error_& e) {
           BuildAndInvoke(k, interrupt, std::move(e));
           return true;
         } catch (...) {
-          // if constexpr (std::is_same_v<Error_, AllHandler>) {
-          //   BuildAndInvoke(k, interrupt, std::current_exception());
-          //   return true;
-          // } else {
-          //   return false;
-          // }
           return false;
         }
       } else {
+        // Just to avoid '-Werror=unused-but-set-parameter' warning.
+        (void) interrupt;
         return false;
       }
     }
@@ -159,34 +159,51 @@ struct _Catch {
           "Catch only supports 0 or 1 argument, but found > 1");
 
       if constexpr (HasAll) {
+        // Create 'HandlerWithK' with 'AllHandler_'
+        // function and 'Args' if exists,
+        // 'void' otherwise.
         if constexpr (sizeof...(args) == 1) {
-          all_handler_ = std::make_any<HandlerWithK<K_, AllHandler_, Args...>>(
-              // 'AllHandler_' there is just a
-              // lambda function for 'all' handler.
-              std::move(std::any_cast<AllHandler_>(std::move(all_handler_))));
+          all_handler_ = std::unique_ptr<void, Callback<void*>>(
+              new HandlerWithK<
+                  K_,
+                  AllHandler_,
+                  Args...>(std::move(all_handler_function_)),
+              [](void* handler_with_k_) {
+                delete static_cast<
+                    HandlerWithK<K_, AllHandler_, Args...>*>(handler_with_k_);
+              });
         } else {
-          all_handler_ = std::make_any<HandlerWithK<K_, AllHandler_, void>>(
-              std::any_cast<AllHandler_>(std::move(all_handler_)));
+          all_handler_ = std::unique_ptr<void, Callback<void*>>(
+              new HandlerWithK<
+                  K_,
+                  AllHandler_,
+                  void>(std::move(all_handler_function_)),
+              [](void* handler_with_k_) {
+                delete static_cast<
+                    HandlerWithK<K_, AllHandler_, void>*>(handler_with_k_);
+              });
         }
       }
 
       if constexpr (sizeof...(args) == 1) {
-        std::apply(
-            [&](auto&&... catch_handlers) {
-              UnpackInvokeHelper(
-                  std::forward<decltype(args)>(args)...,
-                  std::forward<decltype(catch_handlers)>(catch_handlers)...);
-            },
-            std::move(catch_handlers_));
+        if constexpr (std::tuple_size_v<CatchHandlersWithKTuple_> != 0) {
+          std::apply(
+              [&](auto&&... catch_handlers) {
+                UnpackInvokeHelper(
+                    std::forward<decltype(args)>(args)...,
+                    std::forward<decltype(catch_handlers)>(catch_handlers)...);
+              },
+              std::move(catch_handlers_));
+        }
 
         if constexpr (HasAll) {
           if (!processed_) {
-            processed_ = std::any_cast<
+            processed_ = static_cast<
                              HandlerWithK<
                                  K_,
                                  AllHandler_,
-                                 Args...>>(std::move(all_handler_))
-                             .Handle(
+                                 Args...>*>(all_handler_.get())
+                             ->Handle(
                                  k_,
                                  interrupt_,
                                  std::forward<decltype(args)>(args)...);
@@ -195,12 +212,12 @@ struct _Catch {
       } else {
         // Only 'all' hander can be executed with no errors.
         if constexpr (HasAll) {
-          processed_ = std::any_cast<
+          processed_ = static_cast<
                            HandlerWithK<
                                K_,
                                AllHandler_,
-                               void>>(std::move(all_handler_))
-                           .Handle(k_, interrupt_);
+                               void>*>(all_handler_.get())
+                           ->Handle(k_, interrupt_);
         } else {
           k_.Fail(std::forward<decltype(args)>(args)...);
         }
@@ -223,14 +240,14 @@ struct _Catch {
 
     K_ k_;
     CatchHandlersWithKTuple_ catch_handlers_;
-    std::any all_handler_;
+    AllHandler_ all_handler_function_;
+    std::unique_ptr<void, Callback<void*>> all_handler_;
     bool processed_ = false;
 
     Interrupt* interrupt_ = nullptr;
   };
 
   template <
-      // Can't use 'void' instead because of storing in 'std::optional'.
       typename AllHandler_ = std::monostate,
       typename... CatchHandlers_>
   struct Builder {
@@ -263,19 +280,19 @@ struct _Catch {
 
     template <size_t i, typename K>
     auto AddTypeToTuple() {
-      static_assert(
-          i < std::tuple_size_v<decltype(catch_handlers_)>,
-          "No catch handlers specified");
+      if constexpr (sizeof...(CatchHandlers_) == 0) {
+        return std::make_tuple();
+      } else {
+        auto current = std::get<i>(catch_handlers_);
 
-      auto current = std::get<i>(catch_handlers_);
-
-      return AddTypeToTuple<i + 1, K>(
-          std::make_tuple(
-              HandlerWithK<
-                  K,
-                  decltype(current.handler_),
-                  typename decltype(current)::error_type>{
-                  std::move(current.handler_)}));
+        return AddTypeToTuple<i + 1, K>(
+            std::make_tuple(
+                HandlerWithK<
+                    K,
+                    decltype(current.handler_),
+                    typename decltype(current)::error_type>{
+                    std::move(current.handler_)}));
+      }
     }
 
     template <typename Arg, typename K>
@@ -294,7 +311,7 @@ struct _Catch {
       return Continuation<K, AllHandler_, decltype(handlers_with_k)>{
           std::move(k),
           std::move(handlers_with_k),
-          std::make_any<AllHandler_>(std::move(all_handler_))};
+          std::move(all_handler_)};
     }
 
     template <typename E, typename F>
