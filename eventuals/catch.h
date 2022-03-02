@@ -7,6 +7,7 @@
 
 #include "eventuals/callback.h"
 #include "eventuals/eventual.h"
+#include "eventuals/terminal.h"
 #include "eventuals/then.h"
 
 ////////////////////////////////////////////////////////////////////////
@@ -36,7 +37,20 @@ struct _Catch final {
     // calling this function in the event that we _don't_ end up handling the
     // error.
     bool Handle(K_&& k, Interrupt* interrupt, E&& e) {
-      if constexpr (
+      // When 'Error_' is 'std::exception_ptr' it indicates we're the
+      // 'all' handler which catches everything and makes a
+      // 'std::exception_ptr' if we don't already have one.
+      if constexpr (std::is_same_v<Error_, std::exception_ptr>) {
+        adapted_.emplace(Then(std::move(f_)).template k<Error_>(std::move(k)));
+
+        if (interrupt != nullptr) {
+          adapted_->Register(*interrupt);
+        }
+
+        adapted_->Start(make_exception_ptr_or_forward(std::forward<E>(e)));
+
+        return true;
+      } else if constexpr (
           std::is_same_v<Error_, E> || std::is_base_of_v<Error_, E>) {
         adapted_.emplace(Then(std::move(f_)).template k<Error_>(std::move(k)));
 
@@ -85,17 +99,10 @@ struct _Catch final {
 
   ////////////////////////////////////////////////////////////////////////
 
-  template <
-      typename K_,
-      typename AllF_,
-      typename... CatchHandlers_>
+  template <typename K_, typename... CatchHandlers_>
   struct Continuation final {
-    Continuation(
-        K_ k,
-        std::tuple<CatchHandlers_...>&& catch_handlers,
-        AllF_ all_f)
+    Continuation(K_ k, std::tuple<CatchHandlers_...>&& catch_handlers)
       : catch_handlers_(std::move(catch_handlers)),
-        all_f_(std::move(all_f)),
         k_(std::move(k)) {}
 
     template <typename... Args>
@@ -124,46 +131,6 @@ struct _Catch final {
           },
           catch_handlers_);
 
-      // Try the "all" handler if present.
-      if (!handled_) {
-        if constexpr (!IsUndefined<AllF_>::value) {
-          using AllInvokeResult = std::invoke_result_t<AllF_, Args...>;
-
-          if constexpr (std::is_void_v<AllInvokeResult>) {
-            all_f_(std::forward<Args>(args)...);
-            k_.Fail(
-                std::make_exception_ptr(
-                    "'all' handler empty propagate error"));
-          } else {
-            if constexpr (HasValueFrom<AllInvokeResult>::value) {
-              using AllE = decltype(all_f_(std::forward<Args>(args)...)
-                                        .template k<void>(
-                                            _Then::Adaptor<K_>{k_}));
-
-              // TODO(benh): propagate eventual errors so we don't need to
-              // allocate on the heap in order to type erase.
-              all_e_ = std::unique_ptr<void, Callback<void*>>(
-                  new AllE(all_f_(std::forward<Args>(args)...)
-                               .template k<void>(_Then::Adaptor<K_>{k_})),
-                  [](void* e) {
-                    delete static_cast<AllE*>(e);
-                  });
-
-              auto* e = static_cast<AllE*>(all_e_.get());
-
-              if (interrupt_ != nullptr) {
-                e->Register(*interrupt_);
-              }
-
-              e->Start();
-            } else {
-              k_.Start(all_f_(std::forward<Args>(args)...));
-            }
-          }
-          handled_ = true;
-        }
-      }
-
       if (!handled_) {
         k_.Fail(std::forward<decltype(args)>(args)...);
       }
@@ -179,15 +146,10 @@ struct _Catch final {
     }
 
     std::tuple<CatchHandlers_...> catch_handlers_;
-    AllF_ all_f_;
 
     bool handled_ = false;
 
     Interrupt* interrupt_ = nullptr;
-
-    // TODO(benh): propagate eventual errors so we don't need to
-    // allocate on the heap in order to type erase.
-    std::unique_ptr<void, Callback<void*>> all_e_;
 
     // NOTE: we store 'k_' as the _last_ member so it will be
     // destructed _first_ and thus we won't have any use-after-delete
@@ -196,13 +158,12 @@ struct _Catch final {
     K_ k_;
   };
 
-  template <typename...>
-  struct UnifyUnpacker {
-    using type = void;
-  };
+  template <typename Value_, bool has_all_, typename... CatchHandlers_>
+  struct Builder final {
+    // NOTE: we ensure 'Arg' and 'Value_' are the same in 'k()'.
+    template <typename Arg>
+    using ValueFrom = Arg;
 
-  template <typename LeftHandler, typename RightHandler, typename... Handlers>
-  struct UnifyUnpacker<LeftHandler, RightHandler, Handlers...> {
     template <typename Left, typename Right>
     using Unify_ = typename std::conditional_t<
         std::is_same_v<Left, Right>,
@@ -212,39 +173,22 @@ struct _Catch final {
             type_identity<Right>,
             std::enable_if<std::is_void_v<Right>, Left>>>::type;
 
-    using Left_ = std::invoke_result_t<
-        typename LeftHandler::Function,
-        typename LeftHandler::Error>;
-    using Right_ = std::invoke_result_t<
-        typename RightHandler::Function,
-        typename RightHandler::Error>;
-
-    using current_ = Unify_<
-        ValueFromMaybeComposable<Left_, void>,
-        ValueFromMaybeComposable<Right_, void>>;
-
-    using type = Unify_<current_, typename UnifyUnpacker<Handlers...>::type>;
-  };
-
-  template <typename ReturnType_, typename AllF_, typename... CatchHandlers_>
-  struct Builder final {
-    template <typename Arg>
-    using ValueFrom = ReturnType_;
-
-    template <typename ReturnType, typename AllF, typename... CatchHandlers>
-    static auto create(
-        std::tuple<CatchHandlers...>&& catch_handlers,
-        AllF all_f) {
-      return Builder<ReturnType, AllF, CatchHandlers...>{
-          std::move(catch_handlers),
-          std::move(all_f)};
+    template <typename Value, bool has_all, typename... CatchHandlers>
+    static auto create(std::tuple<CatchHandlers...>&& catch_handlers) {
+      return Builder<Value, has_all, CatchHandlers...>{
+          std::move(catch_handlers)};
     }
 
     template <typename Arg, typename K>
     auto k(K k) && {
       static_assert(
-          sizeof...(CatchHandlers_) > 0 || !IsUndefined<AllF_>::value,
+          sizeof...(CatchHandlers_) > 0,
           "No handlers were specified for 'Catch'");
+
+      static_assert(
+          std::is_same_v<Arg, Value_>,
+          "Catch handlers must return an eventual value of the same "
+          "type as passed from upstream");
 
       // Convert each catch handler to one with 'K' instead of
       // 'Undefined' and then return 'Continuation'.
@@ -252,85 +196,76 @@ struct _Catch final {
           [&](auto&&... catch_handler) {
             return Continuation<
                 K,
-                AllF_,
                 decltype(std::move(catch_handler).template Convert<K>())...>(
                 std::move(k),
-                std::tuple{std::move(catch_handler).template Convert<K>()...},
-                std::move(all_f_));
+                std::tuple{std::move(catch_handler).template Convert<K>()...});
           },
           std::move(catch_handlers_));
     }
 
     template <typename Error, typename F>
     auto raised(F f) {
+      static_assert(!has_all_, "'all' handler must be installed last");
+
       static_assert(
-          IsUndefined<AllF_>::value,
-          "'all' handler must be installed last");
+          !std::is_same_v<Error, std::exception_ptr>,
+          "Only the 'all' handler catches 'std::exception_ptr'");
 
       static_assert(
           std::is_invocable_v<F, Error>,
           "Catch handler can not be invoked with your specified error");
 
-      using Unified = std::conditional_t<
-          sizeof...(CatchHandlers_) >= 2,
-          typename UnifyUnpacker<
-              Handler<Undefined, Error, F>,
-              CatchHandlers_...>::type,
-          ReturnType_>;
-
-      using InitialType = ValueFromMaybeComposable<
+      using Value = ValueFromMaybeComposable<
           std::invoke_result_t<F, Error>,
           void>;
 
-      return create<
-          std::conditional_t<
-              IsUndefined<ReturnType_>::value,
-              InitialType,
-              Unified>>(
+      static_assert(
+          std::disjunction_v<
+              std::is_same<Value, Value_>,
+              std::is_void<Value>,
+              std::is_void<Value_>>,
+          "Catch handlers do not return an eventual value of the same type");
+
+      return create<Unify_<Value_, Value>, has_all_>(
           std::tuple_cat(
               std::move(catch_handlers_),
-              std::tuple{Handler<Undefined, Error, F>{std::move(f)}}),
-          std::move(all_f_));
+              std::tuple{Handler<Undefined, Error, F>{std::move(f)}}));
     }
 
     template <typename F>
     auto all(F f) {
-      static_assert(IsUndefined<AllF_>::value, "Duplicate 'all'");
+      static_assert(!has_all_, "Duplicate 'all'");
 
-      // We can use any parameter type for 'all' handler,
-      // since it should be invocable for any errors.
-      struct ArbitraryTypeForTestingInvocable {};
       static_assert(
-          std::is_invocable_v<F, ArbitraryTypeForTestingInvocable>,
-          "Function specified at 'all' must support invoking with any type");
+          std::is_invocable_v<F, std::exception_ptr>,
+          "Catch 'all' handler must be invocable with 'std::exception_ptr'");
 
-      using Unified = std::conditional_t<
-          sizeof...(CatchHandlers_) >= 2,
-          typename UnifyUnpacker<
-              Handler<Undefined, ArbitraryTypeForTestingInvocable, F>,
-              CatchHandlers_...>::type,
-          ReturnType_>;
-
-      using InitialType = ValueFromMaybeComposable<
-          std::invoke_result_t<F, ArbitraryTypeForTestingInvocable>,
+      using Value = ValueFromMaybeComposable<
+          std::invoke_result_t<F, std::exception_ptr>,
           void>;
 
-      return create<
-          std::conditional_t<
-              IsUndefined<ReturnType_>::value,
-              InitialType,
-              Unified>>(std::move(catch_handlers_), std::move(f));
+      static_assert(
+          std::disjunction_v<
+              std::is_same<Value, Value_>,
+              std::is_void<Value>,
+              std::is_void<Value_>>,
+          "Catch handlers do not return an eventual value of the same type");
+
+      return create<Unify_<Value_, Value>, true>(
+          std::tuple_cat(
+              std::move(catch_handlers_),
+              std::tuple{
+                  Handler<Undefined, std::exception_ptr, F>{std::move(f)}}));
     }
 
     std::tuple<CatchHandlers_...> catch_handlers_;
-    AllF_ all_f_;
   };
 };
 
 ////////////////////////////////////////////////////////////////////////
 
 inline auto Catch() {
-  return _Catch::Builder<Undefined, Undefined>{};
+  return _Catch::Builder<void, false>{};
 }
 
 template <typename F>

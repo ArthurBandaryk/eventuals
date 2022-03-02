@@ -81,9 +81,11 @@ TEST(CatchTest, All) {
                     << "Encountered an unexpected raised 'std::string'";
                 return 10;
               })
-              .all([](auto&& error) {
-                if constexpr (std::is_same_v<decltype(error), const char*>) {
-                  EXPECT_EQ(error.what(), "10");
+              .all([](std::exception_ptr&& error) {
+                try {
+                  std::rethrow_exception(error);
+                } catch (const std::runtime_error& error) {
+                  EXPECT_STREQ(error.what(), "10");
                 }
                 return 100;
               })
@@ -147,18 +149,13 @@ TEST(CatchTest, UnexpectedAll) {
                     << "Encountered an unexpected raised 'std::string'";
                 return 1;
               })
-              // Receive 'std::exception_ptr' there.
-              .all([](auto&& error) {
-                if constexpr (std::is_same_v<
-                                  decltype(error),
-                                  std::exception_ptr>) {
-                  try {
-                    std::rethrow_exception(error);
-                  } catch (Error e) {
-                    EXPECT_EQ(e.what(), std::string("child exception"));
-                  } catch (...) {
-                    FAIL() << "Failure on rethrowing";
-                  }
+              .all([](std::exception_ptr&& error) {
+                try {
+                  std::rethrow_exception(error);
+                } catch (const Error& e) {
+                  EXPECT_STREQ(e.what(), "child exception");
+                } catch (...) {
+                  ADD_FAILURE() << "Failure on rethrowing";
                 }
 
                 return 100;
@@ -196,12 +193,7 @@ TEST(CatchTest, ReRaise) {
                 EXPECT_EQ(error.what(), std::string("10"));
                 return Raise("1");
               })
-              .raised<std::exception_ptr>([](auto&& error) {
-                ADD_FAILURE()
-                    << "Encountered an unexpected raised 'std::exception_ptr'";
-                return 100;
-              })
-              .all([](auto&& error) {
+              .all([](std::exception_ptr&& error) {
                 ADD_FAILURE() << "Encountered an unexpected all";
                 return Just(100);
               })
